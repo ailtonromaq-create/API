@@ -1,4 +1,5 @@
 import express from "express";
+import cors from "cors";
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -10,14 +11,11 @@ import { z } from "zod";
 const API_BASE_URL = process.env.EPROM_API_BASE_URL || "https://open-api.eprom.com.br/api";
 const PORT = process.env.PORT || 3000;
 
-// Credenciais padrão (opcional). Se definidas, o servidor tenta logar sozinho
-// na primeira chamada, sem precisar que o usuário chame eprom_login antes.
 const DEFAULT_EMAIL = process.env.EPROM_EMAIL || null;
 const DEFAULT_SENHA = process.env.EPROM_SENHA || null;
 
 // ---------------------------------------------------------------------------
-// Estado de autenticação (em memória - processo único).
-// Para uso multi-tenant sério, troque isso por um cache por sessão/usuário.
+// Estado de autenticação (em memória - processo único)
 // ---------------------------------------------------------------------------
 const authState = {
   accessToken: null,
@@ -28,7 +26,7 @@ const authState = {
 
 function isExpired(iso) {
   if (!iso) return true;
-  return new Date(iso).getTime() <= Date.now() + 5000; // 5s de folga
+  return new Date(iso).getTime() <= Date.now() + 5000;
 }
 
 async function login(email, senha) {
@@ -61,9 +59,6 @@ async function ensureAuthenticated() {
   if (authState.accessToken && !isExpired(authState.accessTokenExpiration)) {
     return;
   }
-  // TODO: a API expõe apenas /Auth/Login na documentação capturada.
-  // Se houver endpoint de refresh, ele pode ser adicionado aqui usando
-  // authState.refreshToken antes de cair para o login por email/senha.
   if (DEFAULT_EMAIL && DEFAULT_SENHA) {
     await login(DEFAULT_EMAIL, DEFAULT_SENHA);
     return;
@@ -152,24 +147,13 @@ function buildServer() {
     }
   );
 
-  // -- Ferramenta genérica (cobre qualquer endpoint da API) --------------
+  // -- Ferramenta genérica ----------------------------------------------
   server.registerTool(
     "eprom_request",
     {
       title: "Chamada genérica à API Eprom",
       description:
-        "Faz uma chamada a qualquer endpoint da Open API do ERP E-Solution (Eprom). " +
-        "Use isso para qualquer recurso não coberto pelas ferramentas de atalho: " +
-        "Pagamento, Recebimento, Despesa, Despesa/Item, Despesa/Parcelamento, " +
-        "EntradaMercadoria, EntradaMercadoria/Item, EntradaMercadoria/Parcelamento, " +
-        "Fatura, Fatura/Item, Fatura/Parcelamento, NotaEmitida, NotaRecebida, " +
-        "PedidoVenda, PedidoVenda/Item, PedidoVenda/Parcelamento, Entidade, " +
-        "Entidade/Endereco, Entidade/Contato, Entidade/Documento, Entidade/Tipo, " +
-        "Entidade/Vinculo, Equipamento, Produto, Produto/Descricao, Produto/Imagem, " +
-        "GrupoProduto, LinhaProduto, MarcaProduto, UnidadeMedida, FormaPagamento, " +
-        "entre outros descritos na documentação https://docs-openapi.eprom2.com.br. " +
-        "Para GET, use 'query' com os parâmetros de filtro (id, page, size, etc). " +
-        "Para POST/PUT, use 'body' com o payload em JSON. Autentica automaticamente se necessário.",
+        "Faz uma chamada a qualquer endpoint da Open API do ERP E-Solution (Eprom).",
       inputSchema: {
         method: z
           .enum(["GET", "POST", "PUT", "DELETE"])
@@ -177,16 +161,16 @@ function buildServer() {
         path: z
           .string()
           .describe(
-            "Caminho do endpoint relativo à API, ex: '/Despesa', '/Pagamento/123', '/Entidade/Endereco'"
+            "Caminho do endpoint relativo à API, ex: '/Despesa', '/Pagamento/123'"
           ),
         query: z
           .record(z.union([z.string(), z.number(), z.boolean()]))
           .optional()
-          .describe("Parâmetros de query string para GET (ex: {id: 123, page: 1, size: 10})"),
+          .describe("Parâmetros de query string para GET"),
         body: z
           .any()
           .optional()
-          .describe("Corpo JSON para POST/PUT, conforme o schema do endpoint"),
+          .describe("Corpo JSON para POST/PUT"),
       },
     },
     async ({ method, path, query, body }) => {
@@ -199,7 +183,7 @@ function buildServer() {
     }
   );
 
-  // -- Atalhos para os recursos mais usados -------------------------------
+  // -- Atalhos ----------------------------------------------------------
   const shortcut = (name, title, description, path) => {
     server.registerTool(
       name,
@@ -211,11 +195,11 @@ function buildServer() {
           id: z
             .union([z.string(), z.number()])
             .optional()
-            .describe("ID do registro (necessário para GET por id, PUT e DELETE)"),
+            .describe("ID do registro"),
           query: z
             .record(z.union([z.string(), z.number(), z.boolean()]))
             .optional()
-            .describe("Filtros de busca para GET (page, size, status, etc)"),
+            .describe("Filtros de busca para GET"),
           body: z.any().optional().describe("Payload para POST/PUT"),
         },
       },
@@ -231,74 +215,44 @@ function buildServer() {
     );
   };
 
-  shortcut(
-    "eprom_despesa",
-    "Despesas",
-    "Cria, lista, altera ou exclui Despesas (tipo IMPOSTO, DESPESA ou NF) no ERP E-Solution.",
-    "/Despesa"
-  );
-  shortcut(
-    "eprom_pagamento",
-    "Pagamentos (contas a pagar)",
-    "Cria/estorna pagamentos e lista baixas do contas a pagar.",
-    "/Pagamento"
-  );
-  shortcut(
-    "eprom_recebimento",
-    "Recebimentos (contas a receber)",
-    "Cria/estorna recebimentos e lista baixas do contas a receber.",
-    "/Recebimento"
-  );
-  shortcut(
-    "eprom_entrada_mercadoria",
-    "Entrada de Mercadorias",
-    "Cria, lista, altera ou exclui Entradas de Mercadorias (compras).",
-    "/EntradaMercadoria"
-  );
-  shortcut(
-    "eprom_fatura",
-    "Faturas",
-    "Cria, lista, altera ou exclui Faturas.",
-    "/Fatura"
-  );
-  shortcut(
-    "eprom_pedido_venda",
-    "Pedidos de Venda",
-    "Cria, lista, altera ou exclui Pedidos de Venda.",
-    "/PedidoVenda"
-  );
-  shortcut(
-    "eprom_entidade",
-    "Entidades (clientes/fornecedores)",
-    "Cria, lista, altera ou exclui Entidades (clientes, fornecedores, funcionários, etc).",
-    "/Entidade"
-  );
-  shortcut(
-    "eprom_produto",
-    "Produtos",
-    "Cria, lista, altera ou exclui Produtos.",
-    "/Produto"
-  );
+  shortcut("eprom_despesa", "Despesas", "Cria, lista, altera ou exclui Despesas.", "/Despesa");
+  shortcut("eprom_pagamento", "Pagamentos", "Cria/estorna pagamentos.", "/Pagamento");
+  shortcut("eprom_recebimento", "Recebimentos", "Cria/estorna recebimentos.", "/Recebimento");
+  shortcut("eprom_entrada_mercadoria", "Entrada de Mercadorias", "Gestão de compras.", "/EntradaMercadoria");
+  shortcut("eprom_fatura", "Faturas", "Cria, lista, altera ou exclui Faturas.", "/Fatura");
+  shortcut("eprom_pedido_venda", "Pedidos de Venda", "Cria, lista, altera ou exclui Pedidos de Venda.", "/PedidoVenda");
+  shortcut("eprom_entidade", "Entidades", "Gestão de Clientes e Fornecedores.", "/Entidade");
+  shortcut("eprom_produto", "Produtos", "Gestão de Produtos.", "/Produto");
 
   return server;
 }
 
 // ---------------------------------------------------------------------------
-// Express + transporte Streamable HTTP (modo stateless: uma sessão por request)
+// Configuração do Express com CORS e Transporte MCP
 // ---------------------------------------------------------------------------
 const app = express();
+
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS", "DELETE"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-mcp-version", "mcp-session-id"]
+}));
+
 app.use(express.json({ limit: "5mb" }));
 
-app.post("/mcp", async (req, res) => {
+// Handler MCP genérico para aceitar chamadas GET e POST do client
+const handleMcpRequest = async (req, res) => {
   try {
     const server = buildServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
     });
+
     res.on("close", () => {
       transport.close();
       server.close();
     });
+
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
@@ -311,14 +265,15 @@ app.post("/mcp", async (req, res) => {
       });
     }
   }
-});
+};
 
-// GET/DELETE em /mcp não são usados neste modo stateless simples.
-app.get("/mcp", (_req, res) => res.status(405).send("Method Not Allowed"));
-app.delete("/mcp", (_req, res) => res.status(405).send("Method Not Allowed"));
+app.post("/mcp", handleMcpRequest);
+app.get("/mcp", handleMcpRequest);
+app.options("/mcp", (req, res) => res.sendStatus(200));
 
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
+app.get("/", (_req, res) => res.json({ status: "ok", service: "Eprom MCP Server" }));
 
-app.listen(PORT, () => {
-  console.log(`Servidor MCP Eprom rodando em http://localhost:${PORT}/mcp`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Servidor MCP Eprom rodando na porta ${PORT}`);
 });
