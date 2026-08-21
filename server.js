@@ -1,20 +1,15 @@
 import express from "express";
 import cors from "cors";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 
-// ---------------------------------------------------------------------------
-// Configuração
-// ---------------------------------------------------------------------------
 const API_BASE_URL = process.env.EPROM_API_BASE_URL || "https://open-api.eprom.com.br/api";
 const PORT = process.env.PORT || 3000;
 
 const DEFAULT_EMAIL = process.env.EPROM_EMAIL || null;
 const DEFAULT_SENHA = process.env.EPROM_SENHA || null;
 
-// ---------------------------------------------------------------------------
-// Estado de autenticação (em memória)
-// ---------------------------------------------------------------------------
 const authState = {
   accessToken: null,
   accessTokenExpiration: null,
@@ -40,9 +35,7 @@ async function login(email, senha) {
   const data = await resp.json().catch(() => ({}));
 
   if (!resp.ok) {
-    throw new Error(
-      `Falha no login (HTTP ${resp.status}): ${JSON.stringify(data)}`
-    );
+    throw new Error(`Falha no login (HTTP ${resp.status}): ${JSON.stringify(data)}`);
   }
 
   authState.accessToken = data.access_token;
@@ -62,8 +55,7 @@ async function ensureAuthenticated() {
     return;
   }
   throw new Error(
-    "Não autenticado. Chame a ferramenta 'eprom_login' com email e senha, " +
-      "ou defina as variáveis de ambiente EPROM_EMAIL e EPROM_SENHA no servidor."
+    "Não autenticado. Defina as variáveis de ambiente EPROM_EMAIL e EPROM_SENHA ou chame eprom_login."
   );
 }
 
@@ -110,174 +102,150 @@ function toolResult(payload) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Lista de Ferramentas MCP
-// ---------------------------------------------------------------------------
-const TOOLS = [
-  {
-    name: "eprom_login",
-    description: "Autentica na Open API do ERP E-Solution.",
-    parameters: z.object({
-      email: z.string().describe("E-mail de login cadastrado no sistema"),
-      senha: z.string().describe("Senha de login"),
-    }),
-    handler: async ({ email, senha }) => {
-      const data = await login(email, senha);
-      return toolResult({
-        message: "Login realizado com sucesso.",
-        access_token_expiration: data.access_token_expiration,
-        refresh_token_expiration: data.refresh_token_expiration,
-      });
-    }
-  },
-  {
-    name: "eprom_request",
-    description: "Faz uma chamada a qualquer endpoint da Open API do ERP E-Solution.",
-    parameters: z.object({
-      method: z.enum(["GET", "POST", "PUT", "DELETE"]).describe("Método HTTP"),
-      path: z.string().describe("Caminho relativo à API, ex: '/Despesa'"),
-      query: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
-      body: z.any().optional(),
-    }),
-    handler: async ({ method, path, query, body }) => {
-      const result = await epromFetch(method, path, { query, body });
-      return toolResult(result);
-    }
-  }
-];
-
-const shortcuts = [
-  ["eprom_despesa", "Gestão de Despesas.", "/Despesa"],
-  ["eprom_pagamento", "Contas a pagar.", "/Pagamento"],
-  ["eprom_recebimento", "Contas a receber.", "/Recebimento"],
-  ["eprom_entrada_mercadoria", "Compras.", "/EntradaMercadoria"],
-  ["eprom_fatura", "Gestão de Faturas.", "/Fatura"],
-  ["eprom_pedido_venda", "Gestão de Pedidos.", "/PedidoVenda"],
-  ["eprom_entidade", "Clientes e Fornecedores.", "/Entidade"],
-  ["eprom_produto", "Gestão de Produtos.", "/Produto"]
-];
-
-shortcuts.forEach(([name, description, path]) => {
-  TOOLS.push({
-    name,
-    description,
-    parameters: z.object({
-      method: z.enum(["GET", "POST", "PUT", "DELETE"]).describe("Método HTTP"),
-      id: z.union([z.string(), z.number()]).optional().describe("ID do registro"),
-      query: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
-      body: z.any().optional(),
-    }),
-    handler: async ({ method, id, query, body }) => {
-      const fullPath = id ? `${path}/${id}` : path;
-      const result = await epromFetch(method, fullPath, { query, body });
-      return toolResult(result);
-    }
+function buildServer() {
+  const server = new McpServer({
+    name: "eprom-esolution-mcp",
+    version: "1.0.0",
   });
-});
 
-// ---------------------------------------------------------------------------
-// Express Server compatível com GPT Maker (SSE & JSON-RPC)
-// ---------------------------------------------------------------------------
+  server.registerTool(
+    "eprom_login",
+    {
+      title: "Login na API Eprom",
+      description: "Autentica na Open API do ERP E-Solution.",
+      inputSchema: {
+        email: z.string().describe("E-mail de login cadastrado no sistema"),
+        senha: z.string().describe("Senha de login"),
+      },
+    },
+    async ({ email, senha }) => {
+      try {
+        const data = await login(email, senha);
+        return toolResult({
+          message: "Login realizado com sucesso.",
+          access_token_expiration: data.access_token_expiration,
+          refresh_token_expiration: data.refresh_token_expiration,
+        });
+      } catch (err) {
+        return toolResult({ error: String(err.message || err) });
+      }
+    }
+  );
+
+  server.registerTool(
+    "eprom_request",
+    {
+      title: "Chamada genérica à API Eprom",
+      description: "Faz uma chamada a qualquer endpoint da Open API do ERP E-Solution.",
+      inputSchema: {
+        method: z.enum(["GET", "POST", "PUT", "DELETE"]).describe("Método HTTP"),
+        path: z.string().describe("Caminho relativo à API, ex: '/Despesa'"),
+        query: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
+        body: z.any().optional(),
+      },
+    },
+    async ({ method, path, query, body }) => {
+      try {
+        const result = await epromFetch(method, path, { query, body });
+        return toolResult(result);
+      } catch (err) {
+        return toolResult({ error: String(err.message || err) });
+      }
+    }
+  );
+
+  const shortcut = (name, title, description, path) => {
+    server.registerTool(
+      name,
+      {
+        title,
+        description,
+        inputSchema: {
+          method: z.enum(["GET", "POST", "PUT", "DELETE"]).describe("Método HTTP"),
+          id: z.union([z.string(), z.number()]).optional().describe("ID do registro"),
+          query: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
+          body: z.any().optional(),
+        },
+      },
+      async ({ method, id, query, body }) => {
+        try {
+          const fullPath = id ? `${path}/${id}` : path;
+          const result = await epromFetch(method, fullPath, { query, body });
+          return toolResult(result);
+        } catch (err) {
+          return toolResult({ error: String(err.message || err) });
+        }
+      }
+    );
+  };
+
+  shortcut("eprom_despesa", "Despesas", "Gestão de Despesas.", "/Despesa");
+  shortcut("eprom_pagamento", "Pagamentos", "Contas a pagar.", "/Pagamento");
+  shortcut("eprom_recebimento", "Recebimentos", "Contas a receber.", "/Recebimento");
+  shortcut("eprom_entrada_mercadoria", "Entrada de Mercadorias", "Compras.", "/EntradaMercadoria");
+  shortcut("eprom_fatura", "Faturas", "Gestão de Faturas.", "/Fatura");
+  shortcut("eprom_pedido_venda", "Pedidos de Venda", "Gestão de Pedidos.", "/PedidoVenda");
+  shortcut("eprom_entidade", "Entidades", "Clientes e Fornecedores.", "/Entidade");
+  shortcut("eprom_produto", "Produtos", "Gestão de Produtos.", "/Produto");
+
+  return server;
+}
+
 const app = express();
 
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "5mb" }));
 
-// Endpoint SSE (/mcp)
-app.get("/mcp", (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders();
+const transports = new Map();
 
-  const host = req.get("host");
-  const protocol = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "https" : "http";
-  const sessionId = Math.random().toString(36).substring(2, 15);
-  const endpointUrl = `${protocol}://${host}/messages?sessionId=${sessionId}`;
+// Handler de conexão SSE reutilizável
+async function handleSseConnect(req, res) {
+  try {
+    const server = buildServer();
+    const host = req.get("host");
+    const protocol = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "https" : "http";
+    const endpoint = `${protocol}://${host}/messages`;
 
-  res.write(`event: endpoint\ndata: ${endpointUrl}\n\n`);
+    const transport = new SSEServerTransport(endpoint, res);
+    transports.set(transport.sessionId, { server, transport });
 
-  const keepAlive = setInterval(() => {
-    res.write(":\n\n");
-  }, 15000);
+    res.on("close", () => {
+      transport.close();
+      server.close();
+      transports.delete(transport.sessionId);
+    });
 
-  req.on("close", () => {
-    clearInterval(keepAlive);
-  });
+    await server.connect(transport);
+  } catch (err) {
+    console.error("Erro na conexão SSE:", err);
+    if (!res.headersSent) {
+      res.status(500).send("Erro na conexão SSE");
+    }
+  }
+}
+
+// Aceita a conexão SSE tanto na raiz / quanto em /mcp
+app.get("/mcp", handleSseConnect);
+app.get("/", (req, res) => {
+  if (req.headers.accept && req.headers.accept.includes("text/event-stream")) {
+    return handleSseConnect(req, res);
+  }
+  res.json({ status: "ok", service: "Eprom MCP Server" });
 });
 
-// Processamento de Mensagens JSON-RPC MCP (/messages)
+// Endpoint do protocolo MCP para trocar mensagens
 app.post("/messages", async (req, res) => {
-  const { jsonrpc, id, method, params } = req.body || {};
+  const sessionId = req.query.sessionId;
+  const session = transports.get(sessionId);
 
-  if (method === "initialize") {
-    return res.json({
-      jsonrpc: "2.0",
-      id,
-      result: {
-        protocolVersion: "2024-11-05",
-        capabilities: { tools: {} },
-        serverInfo: { name: "eprom-esolution-mcp", version: "1.0.0" }
-      }
-    });
+  if (!session) {
+    return res.status(404).send("Sessão MCP não encontrada");
   }
 
-  if (method === "notifications/initialized") {
-    return res.status(202).send();
-  }
-
-  if (method === "tools/list") {
-    return res.json({
-      jsonrpc: "2.0",
-      id,
-      result: {
-        tools: TOOLS.map(t => ({
-          name: t.name,
-          description: t.description,
-          inputSchema: {
-            type: "object",
-            properties: {}
-          }
-        }))
-      }
-    });
-  }
-
-  if (method === "tools/call") {
-    const tool = TOOLS.find(t => t.name === params?.name);
-    if (!tool) {
-      return res.json({
-        jsonrpc: "2.0",
-        id,
-        error: { code: -32601, message: `Ferramenta ${params?.name} não encontrada.` }
-      });
-    }
-
-    try {
-      const result = await tool.handler(params?.arguments || {});
-      return res.json({
-        jsonrpc: "2.0",
-        id,
-        result
-      });
-    } catch (err) {
-      return res.json({
-        jsonrpc: "2.0",
-        id,
-        result: toolResult({ error: String(err.message || err) })
-      });
-    }
-  }
-
-  return res.json({
-    jsonrpc: "2.0",
-    id,
-    error: { code: -32601, message: "Método não suportado" }
-  });
+  await session.transport.handlePostMessage(req, res);
 });
 
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
-app.get("/", (_req, res) => res.json({ status: "ok", service: "Eprom MCP Server" }));
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Servidor MCP Eprom rodando na porta ${PORT}`);
