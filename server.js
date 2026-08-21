@@ -205,7 +205,7 @@ function buildServer() {
 }
 
 // ---------------------------------------------------------------------------
-// Express + SSE Transport
+// Express + Transports
 // ---------------------------------------------------------------------------
 const app = express();
 
@@ -219,11 +219,11 @@ app.use(express.json({ limit: "5mb" }));
 
 const transports = new Map();
 
+// Rota GET /mcp (Handshake SSE)
 app.get("/mcp", async (req, res) => {
   try {
     const server = buildServer();
     
-    // Constrói o endpoint de mensagens dinamicamente com base no host
     const host = req.get("host");
     const protocol = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "https" : "http";
     const endpoint = `${protocol}://${host}/messages`;
@@ -247,6 +247,31 @@ app.get("/mcp", async (req, res) => {
   }
 });
 
+// Rota POST /mcp (Validação de handshake do GPT Maker)
+app.post("/mcp", async (req, res) => {
+  const sessionId = req.query.sessionId;
+
+  if (sessionId && transports.has(sessionId)) {
+    const session = transports.get(sessionId);
+    return await session.transport.handlePostMessage(req, res);
+  }
+
+  res.setHeader("Content-Type", "application/json");
+  res.status(200).json({
+    jsonrpc: "2.0",
+    result: {
+      serverInfo: {
+        name: "eprom-esolution-mcp",
+        version: "1.0.0"
+      },
+      capabilities: {
+        tools: {}
+      }
+    }
+  });
+});
+
+// Rota POST /messages (Processamento das mensagens da sessão SSE)
 app.post("/messages", async (req, res) => {
   const sessionId = req.query.sessionId;
   const session = transports.get(sessionId);
