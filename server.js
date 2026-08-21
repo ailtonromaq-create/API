@@ -1,7 +1,10 @@
+import { randomUUID } from "node:crypto";
 import express from "express";
 import cors from "cors";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 const API_BASE_URL = process.env.EPROM_API_BASE_URL || "https://open-api.eprom.com.br/api";
@@ -10,6 +13,12 @@ const PORT = process.env.PORT || 3000;
 const DEFAULT_EMAIL = process.env.EPROM_EMAIL || null;
 const DEFAULT_SENHA = process.env.EPROM_SENHA || null;
 
+// ---------------------------------------------------------------------------
+// Estado de autenticação na API Eprom
+// (single-tenant: um único par de credenciais compartilhado por todo o
+// processo. Se precisar multiusuário de verdade, isso teria que virar um
+// Map por sessionId — ver observação no final.)
+// ---------------------------------------------------------------------------
 const authState = {
   accessToken: null,
   accessTokenExpiration: null,
@@ -102,6 +111,9 @@ function toolResult(payload) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Definição das tools MCP (compartilhada por Streamable HTTP e SSE)
+// ---------------------------------------------------------------------------
 function buildServer() {
   const server = new McpServer({
     name: "eprom-esolution-mcp",
@@ -193,26 +205,78 @@ function buildServer() {
 
 const app = express();
 
-app.use(cors({ origin: "*" }));
+app.use(cors({ origin: "*", exposedHeaders: ["Mcp-Session-Id"] }));
 app.use(express.json({ limit: "5mb" }));
 
-const transports = new Map();
+// =============================================================================
+// TRANSPORTE 1: Streamable HTTP (protocolo MCP atual — use este no GPT Maker)
+// Rota única /mcp que lida com POST (mensagens), GET (stream do servidor) e
+// DELETE (encerrar sessão). Sessão identificada pelo header Mcp-Session-Id.
+// =============================================================================
+const streamableTransports = new Map();
 
-// Handler de conexão SSE reutilizável
-async function handleSseConnect(req, res) {
+app.post("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
+  let transport;
+
+  if (sessionId && streamableTransports.has(sessionId)) {
+    transport = streamableTransports.get(sessionId);
+  } else if (!sessionId && isInitializeRequest(req.body)) {
+    // Nova sessão: cria transporte + server dedicados
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (newSessionId) => {
+        streamableTransports.set(newSessionId, transport);
+      },
+    });
+
+    transport.onclose = () => {
+      if (transport.sessionId) {
+        streamableTransports.delete(transport.sessionId);
+      }
+    };
+
+    const server = buildServer();
+    await server.connect(transport);
+  } else {
+    return res.status(400).json({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Sessão inválida ou requisição de inicialização ausente." },
+      id: null,
+    });
+  }
+
+  await transport.handleRequest(req, res, req.body);
+});
+
+async function handleStreamableSessionRequest(req, res) {
+  const sessionId = req.headers["mcp-session-id"];
+  if (!sessionId || !streamableTransports.has(sessionId)) {
+    return res.status(400).send("Sessão inválida ou ausente.");
+  }
+  const transport = streamableTransports.get(sessionId);
+  await transport.handleRequest(req, res);
+}
+
+app.get("/mcp", handleStreamableSessionRequest);
+app.delete("/mcp", handleStreamableSessionRequest);
+
+// =============================================================================
+// TRANSPORTE 2: SSE legado (fallback para clientes que ainda não suportam
+// Streamable HTTP). Fica em /sse (stream) + /messages (envio de mensagens).
+// =============================================================================
+const sseTransports = new Map();
+
+app.get("/sse", async (req, res) => {
   try {
     const server = buildServer();
-    const host = req.get("host");
-    const protocol = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "https" : "http";
-    const endpoint = `${protocol}://${host}/messages`;
-
-    const transport = new SSEServerTransport(endpoint, res);
-    transports.set(transport.sessionId, { server, transport });
+    const transport = new SSEServerTransport("/messages", res);
+    sseTransports.set(transport.sessionId, { server, transport });
 
     res.on("close", () => {
       transport.close();
       server.close();
-      transports.delete(transport.sessionId);
+      sseTransports.delete(transport.sessionId);
     });
 
     await server.connect(transport);
@@ -222,31 +286,38 @@ async function handleSseConnect(req, res) {
       res.status(500).send("Erro na conexão SSE");
     }
   }
-}
-
-// Aceita a conexão SSE tanto na raiz / quanto em /mcp
-app.get("/mcp", handleSseConnect);
-app.get("/", (req, res) => {
-  if (req.headers.accept && req.headers.accept.includes("text/event-stream")) {
-    return handleSseConnect(req, res);
-  }
-  res.json({ status: "ok", service: "Eprom MCP Server" });
 });
 
-// Endpoint do protocolo MCP para trocar mensagens
 app.post("/messages", async (req, res) => {
   const sessionId = req.query.sessionId;
-  const session = transports.get(sessionId);
+  const session = sseTransports.get(sessionId);
 
   if (!session) {
     return res.status(404).send("Sessão MCP não encontrada");
   }
 
-  await session.transport.handlePostMessage(req, res);
+  // req.body já foi parseado pelo express.json() acima — precisa ser
+  // repassado explicitamente, senão o transporte tenta ler o stream de
+  // novo e encontra o corpo vazio.
+  await session.transport.handlePostMessage(req, res, req.body);
+});
+
+// =============================================================================
+app.get("/", (_req, res) => {
+  res.json({
+    status: "ok",
+    service: "Eprom MCP Server",
+    transports: {
+      streamable_http: "/mcp",
+      sse_legacy: "/sse (stream) + /messages (post)",
+    },
+  });
 });
 
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Servidor MCP Eprom rodando na porta ${PORT}`);
+  console.log(`  Streamable HTTP: POST/GET/DELETE /mcp`);
+  console.log(`  SSE legado:      GET /sse  +  POST /messages`);
 });
