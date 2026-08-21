@@ -222,7 +222,13 @@ const transports = new Map();
 app.get("/mcp", async (req, res) => {
   try {
     const server = buildServer();
-    const transport = new SSEServerTransport("/messages", res);
+    
+    // Constrói o endpoint de mensagens dinamicamente com base no host
+    const host = req.get("host");
+    const protocol = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "https" : "http";
+    const endpoint = `${protocol}://${host}/messages`;
+
+    const transport = new SSEServerTransport(endpoint, res);
     
     transports.set(transport.sessionId, { server, transport });
 
